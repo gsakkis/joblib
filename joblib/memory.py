@@ -32,7 +32,11 @@ from ._compat import _basestring, PY3_OR_LATER
 from ._store_backends import StoreBackendBase, FileSystemStoreBackend
 
 if sys.version_info[:2] >= (3, 4):
+    import asyncio
     import pathlib
+    iscoroutinefunction = asyncio.iscoroutinefunction
+else:
+    iscoroutinefunction = lambda _: False
 
 
 FIRST_LINE_TEXT = "# first line:"
@@ -531,7 +535,15 @@ class MemorizedFunc(Logger):
                 must_call = True
 
         if must_call:
-            out, metadata = self.call(*args, **kwargs)
+            start_time = time.time()
+            out = self.call(*args, **kwargs)
+            duration = time.time() - start_time
+            metadata = self._persist_input(duration, args, kwargs)
+            if self._verbose > 0:
+                _, name = get_func_name(self.func)
+                msg = '%s - %s' % (name, format_time(duration))
+                print(max(0, (80 - len(msg))) * '_' + msg)
+
             if self.mmap_mode is not None:
                 # Memmap the output at the first call to be consistent with
                 # later calls
@@ -724,25 +736,15 @@ class MemorizedFunc(Logger):
         self._write_func_code(func_code, first_line)
 
     def call(self, *args, **kwargs):
-        """ Force the execution of the function with the given arguments and
-            persist the output values.
+        """ Force the execution of the function with the given arguments
+            and persist the output values.
         """
-        start_time = time.time()
         func_id, args_id = self._get_output_identifiers(*args, **kwargs)
         if self._verbose > 0:
             print(format_call(self.func, args, kwargs))
-        output = self.func(*args, **kwargs)
-        self.store_backend.dump_item(
-            [func_id, args_id], output, verbose=self._verbose)
-
-        duration = time.time() - start_time
-        metadata = self._persist_input(duration, args, kwargs)
-
-        if self._verbose > 0:
-            _, name = get_func_name(self.func)
-            msg = '%s - %s' % (name, format_time(duration))
-            print(max(0, (80 - len(msg))) * '_' + msg)
-        return output, metadata
+        out = self.func(*args, **kwargs)
+        self.store_backend.dump_item([func_id, args_id], out, self._verbose)
+        return out
 
     def _persist_input(self, duration, args, kwargs, this_duration_limit=0.5):
         """ Save a small summary of the call using json format in the
@@ -805,6 +807,69 @@ class MemorizedFunc(Logger):
             class_name=self.__class__.__name__,
             func=self.func,
             location=self.store_backend.location,)
+
+
+###############################################################################
+# class `AsyncMemorizedFunc`
+###############################################################################
+class AsyncMemorizedFunc(MemorizedFunc):
+    """
+    Callable object decorating a coroutine function for caching its return
+    value each time it is awaited.
+
+    This callable always returns an ``asyncio.Future`` object when called:
+    - If the function result is not cached, the returned future is added to
+      the event loop. Once the future is done, its result is persisted to the
+      store backend.
+    - If the function result is cached, the returned future is already done
+      with its result set to the cached function result.
+
+    Attributes
+    ----------
+    Same as :class:`joblib.memory.MemorizedFunc` plus ``loop``
+
+    loop: event loop
+        The event loop to use for the returned futures.
+    """
+
+    def __init__(self, func, location, backend='local', ignore=None,
+                 mmap_mode=None, compress=False, verbose=1, timestamp=None,
+                 loop=None):
+        if sys.version_info[:2] < (3, 4):
+            raise NotImplementedError("AsyncMemorizedFunc is only available "
+                                      "for python version >= 3.4")
+        super().__init__(func, location, backend=backend, ignore=ignore,
+                         mmap_mode=mmap_mode, compress=compress,
+                         verbose=verbose, timestamp=timestamp)
+        self.loop = loop
+
+    def __getstate__(self):
+        """We can't store the event loop when pickling"""
+        state = super().__getstate__()
+        state['loop'] = None
+        return state
+
+    def __call__(self, *args, **kwargs):
+        out = super().__call__(*args, **kwargs)
+        if isinstance(out, asyncio.Future):
+            future = out
+        else:
+            future = asyncio.Future(loop=self.loop)
+            future.set_result(out)
+        return future
+
+    def call(self, *args, **kwargs):
+        func_id, args_id = self._get_output_identifiers(*args, **kwargs)
+        if self._verbose > 0:
+            print(format_call(self.func, args, kwargs))
+        out = self.func(*args, **kwargs)
+        future = asyncio.ensure_future(out, loop=self.loop)
+        future.add_done_callback(functools.partial(self._dump_future_result,
+                                                   path=[func_id, args_id]))
+        return future
+
+    def _dump_future_result(self, future, path):
+        self.store_backend.dump_item(path, future.result(), self._verbose)
 
 
 ###############################################################################
@@ -920,7 +985,8 @@ class Memory(Logger):
             return None
         return os.path.join(self.location, 'joblib')
 
-    def cache(self, func=None, ignore=None, verbose=None, mmap_mode=False):
+    def cache(self, func=None, ignore=None, verbose=None, mmap_mode=False,
+              loop=None):
         """ Decorates the given function func to only compute its return
             value for input arguments not cached on disk.
 
@@ -937,6 +1003,8 @@ class Memory(Logger):
                 The memmapping mode used when loading from cache
                 numpy arrays. See numpy.load for the meaning of the
                 arguments. By default that of the memory object is used.
+            loop: event loop, optional
+                The event loop to be used if func is a coroutine function
 
             Returns
             -------
@@ -949,7 +1017,7 @@ class Memory(Logger):
         if func is None:
             # Partial application, to be able to specify extra keyword
             # arguments in decorators
-            return functools.partial(self.cache, ignore=ignore,
+            return functools.partial(self.cache, ignore=ignore, loop=loop,
                                      verbose=verbose, mmap_mode=mmap_mode)
         if self.store_backend is None:
             return NotMemorizedFunc(func)
@@ -959,11 +1027,14 @@ class Memory(Logger):
             mmap_mode = self.mmap_mode
         if isinstance(func, MemorizedFunc):
             func = func.func
-        return MemorizedFunc(func, location=self.store_backend,
-                             backend=self.backend,
-                             ignore=ignore, mmap_mode=mmap_mode,
-                             compress=self.compress,
-                             verbose=verbose, timestamp=self.timestamp)
+        kwargs = dict(func=func, location=self.store_backend,
+                      backend=self.backend, ignore=ignore,
+                      mmap_mode=mmap_mode, compress=self.compress,
+                      verbose=verbose, timestamp=self.timestamp)
+        if iscoroutinefunction(func):
+            return AsyncMemorizedFunc(loop=loop, **kwargs)
+        else:
+            return MemorizedFunc(**kwargs)
 
     def clear(self, warn=True):
         """ Erase the complete cache directory.

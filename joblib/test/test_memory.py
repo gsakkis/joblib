@@ -32,6 +32,7 @@ from joblib._compat import PY3_OR_LATER
 from joblib.hashing import hash
 
 if sys.version_info[:2] >= (3, 4):
+    import asyncio
     import pathlib
 
 
@@ -1210,3 +1211,36 @@ def test_memory_pickle_dump_load(tmpdir, memory_kwargs):
     compare(memorized_result, memorized_result_reloaded,
             ignored_attrs=set(['store_backend', 'timestamp']))
     assert hash(memorized_result) == hash(memorized_result_reloaded)
+
+
+skip_asyncio = pytest.mark.skipif(sys.version_info[:2] < (3, 4),
+                                  reason="asyncio is available for "
+                                         "python versions >= 3.4")
+
+def check_identity_lazy_async(func, accumulator, location):
+    """ Similar to check_identity_lazy_async for coroutine functions"""
+    memory = Memory(location=location, verbose=0)
+    func = memory.cache(func)
+
+    @asyncio.coroutine
+    def main():
+        for i in range(3):
+            for _ in range(2):
+                value = yield from func(i)
+                assert value == i
+                assert len(accumulator) == i + 1
+
+    asyncio.get_event_loop().run_until_complete(main())
+
+
+@skip_asyncio
+def test_memory_async(tmpdir):
+    accumulator = list()
+
+    @asyncio.coroutine
+    def coro(x):
+        yield from asyncio.sleep(0.1)
+        accumulator.append(1)
+        return x
+
+    check_identity_lazy_async(coro, accumulator, tmpdir.strpath)
