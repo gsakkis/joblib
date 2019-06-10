@@ -523,9 +523,7 @@ class MemorizedFunc(Logger):
                 print(format_call(self.func, args, kwargs))
                 self._print_duration(duration)
 
-            if self.mmap_mode is not None:
-                # Memmap the output at the first call to be consistent with
-                # later calls
+            if self.mmap_mode is not None and self._load_item_for_mmap:
                 out = self._load_item(path, metadata)
         else:
             metadata = None
@@ -566,6 +564,10 @@ class MemorizedFunc(Logger):
     # ------------------------------------------------------------------------
     # Private interface
     # ------------------------------------------------------------------------
+
+    # Whether to memmap the output at the first call to be consistent with
+    # later calls
+    _load_item_for_mmap = True
 
     def _get_output_identifiers(self, *args, **kwargs):
         """Return the func identifier and input parameter hash of a result."""
@@ -836,14 +838,18 @@ class AsyncMemorizedFunc(MemorizedFunc):
         return future
 
     def call(self, path, args, kwargs):
-        out = self.func(*args, **kwargs)
-        future = asyncio.ensure_future(out, loop=self.loop)
-        future.add_done_callback(functools.partial(self._dump_future_result,
-                                                   path=path))
-        return future
+        return asyncio.ensure_future(self._call_async(path, args, kwargs),
+                                     loop=self.loop)
 
-    def _dump_future_result(self, future, path):
-        self.store_backend.dump_item(path, future.result(), self._verbose)
+    @asyncio.coroutine
+    def _call_async(self, path, args, kwargs):
+        out = yield from self.func(*args, **kwargs)
+        self.store_backend.dump_item(path, out, self._verbose)
+        if self.mmap_mode is not None:
+            out = self._load_item(path)
+        return out
+
+    _load_item_for_mmap = False
 
 
 ###############################################################################
