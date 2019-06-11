@@ -13,6 +13,10 @@ try:
     from distributed.utils_test import loop
 except ImportError:
     loop = None
+try:
+    import asyncio
+except ImportError:
+    collect_ignore = ['joblib/test/test_memory_async.py']
 
 
 def pytest_collection_modifyitems(config, items):
