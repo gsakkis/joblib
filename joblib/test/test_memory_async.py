@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 
 from joblib.memory import Memory
 from joblib.test.common import with_numpy, np
@@ -24,16 +25,69 @@ def check_identity_lazy_async(func, accumulator, location):
     asyncio.get_event_loop().run_until_complete(main())
 
 
-def test_memory_async(tmpdir):
+def test_memory_integration_async(tmpdir):
     accumulator = list()
 
     @asyncio.coroutine
-    def coro(x):
+    def f(l):
+        yield from asyncio.sleep(0.1)
+        accumulator.append(1)
+        return l
+
+    @asyncio.coroutine
+    def main():
+        # Now test clearing
+        for compress in (False, True):
+            for mmap_mode in ('r', None):
+                memory = Memory(location=tmpdir.strpath, verbose=10,
+                                mmap_mode=mmap_mode, compress=compress)
+                # First clear the cache directory, to check that our code can
+                # handle that
+                # NOTE: this line would raise an exception, as the database file is
+                # still open; we ignore the error since we want to test what
+                # happens if the directory disappears
+                shutil.rmtree(tmpdir.strpath, ignore_errors=True)
+                g = memory.cache(f)
+                yield from g(1)
+                g.clear(warn=False)
+                current_accumulator = len(accumulator)
+                out = yield from g(1)
+
+            assert len(accumulator) == current_accumulator + 1
+            # Also, check that Memory.eval works similarly
+            evaled = yield from memory.eval(f, 1)
+            assert evaled == out
+            assert len(accumulator) == current_accumulator + 1
+
+        # Now do a smoke test with a function defined in __main__, as the name
+        # mangling rules are more complex
+        f.__module__ = '__main__'
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        yield from memory.cache(f)(1)
+
+    check_identity_lazy_async(f, accumulator, tmpdir.strpath)
+    asyncio.get_event_loop().run_until_complete(main())
+
+
+def test_no_memory_async():
+    accumulator = list()
+
+    @asyncio.coroutine
+    def ff(x):
         yield from asyncio.sleep(0.1)
         accumulator.append(1)
         return x
 
-    check_identity_lazy_async(coro, accumulator, tmpdir.strpath)
+    @asyncio.coroutine
+    def main():
+        memory = Memory(location=None, verbose=0)
+        gg = memory.cache(ff)
+        for _ in range(4):
+            current_accumulator = len(accumulator)
+            yield from gg(1)
+            assert len(accumulator) == current_accumulator + 1
+
+    asyncio.get_event_loop().run_until_complete(main())
 
 
 @with_numpy
