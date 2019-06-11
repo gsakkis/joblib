@@ -408,22 +408,24 @@ class MemorizedFunc(Logger):
     verbose: int, optional
         The verbosity flag, controls messages that are issued as
         the function is evaluated.
+
+    loop: event loop, optional
+        The event loop to be used if func is a coroutine function
     """
     # ------------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------------
 
     def __init__(self, func, location, backend='local', ignore=None,
-                 mmap_mode=None, compress=False, verbose=1, timestamp=None):
+                 mmap_mode=None, compress=False, verbose=1, timestamp=None,
+                 loop=None):
         Logger.__init__(self)
         self.mmap_mode = mmap_mode
         self.compress = compress
         self.func = func
         self.func_id = _build_func_identifier(func)
-
-        if ignore is None:
-            ignore = []
-        self.ignore = ignore
+        self.ignore = ignore if ignore is not None else []
+        self.loop = loop
         self._verbose = verbose
 
         # retrieve store object from backend type and location.
@@ -437,9 +439,7 @@ class MemorizedFunc(Logger):
             # Create func directory on demand.
             self.store_backend.store_cached_func_code([self.func_id])
 
-        if timestamp is None:
-            timestamp = time.time()
-        self.timestamp = timestamp
+        self.timestamp = timestamp if timestamp is not None else time.time()
         try:
             functools.update_wrapper(self, func)
         except:
@@ -522,7 +522,9 @@ class MemorizedFunc(Logger):
                 print(format_call(self.func, args, kwargs))
                 self._print_duration(duration)
 
-            if self.mmap_mode is not None and self._load_item_for_mmap:
+            if self.mmap_mode is not None and not self._is_async:
+                # Memmap the output at the first call to be consistent with
+                # later calls
                 out = self._load_item(path, metadata)
         else:
             metadata = None
@@ -550,23 +552,26 @@ class MemorizedFunc(Logger):
                                timestamp=self.timestamp)
 
     def __call__(self, *args, **kwargs):
-        return self._cached_call(args, kwargs)[0]
+        out = self._cached_call(args, kwargs)[0]
+        if self._is_async and not isinstance(out, asyncio.Future):
+            future = asyncio.Future(loop=self.loop)
+            future.set_result(out)
+            return future
+        else:
+            return out
 
     def __getstate__(self):
         """ We don't store the timestamp when pickling, to avoid the hash
-            depending from it.
+            depending from it. We also can't store the event loop.
         """
         state = self.__dict__.copy()
         state['timestamp'] = None
+        state['loop'] = None
         return state
 
     # ------------------------------------------------------------------------
     # Private interface
     # ------------------------------------------------------------------------
-
-    # Whether to memmap the output at the first call to be consistent with
-    # later calls
-    _load_item_for_mmap = True
 
     def _get_output_identifiers(self, *args, **kwargs):
         """Return the func identifier and input parameter hash of a result."""
@@ -706,9 +711,30 @@ class MemorizedFunc(Logger):
         """ Force the execution of the function with the given arguments
             and persist the output values.
         """
-        out = self.func(*args, **kwargs)
-        self.store_backend.dump_item(path, out, self._verbose)
-        return out
+        if self._is_async:
+            coro = self._call_async(path, args, kwargs)
+            return asyncio.ensure_future(coro, loop=self.loop)
+        else:
+            out = self.func(*args, **kwargs)
+            self.store_backend.dump_item(path, out, self._verbose)
+            return out
+
+    # exec is needed to define a function with 'yield from' while avoiding
+    # a SyntaxError on Python 2
+    if asyncio is not None:
+        exec("""
+@asyncio.coroutine
+def _call_async(self, path, args, kwargs):
+    out = yield from self.func(*args, **kwargs)
+    self.store_backend.dump_item(path, out, self._verbose)
+    if self.mmap_mode is not None:
+        out = self._load_item(path)
+    return out
+""")
+
+    @property
+    def _is_async(self):
+        return asyncio is not None and asyncio.iscoroutinefunction(self.func)
 
     def _persist_input(self, duration, path, args, kwargs,
                        this_duration_limit=0.5):
@@ -788,72 +814,6 @@ class MemorizedFunc(Logger):
 
 
 ###############################################################################
-# class `AsyncMemorizedFunc`
-###############################################################################
-class AsyncMemorizedFunc(MemorizedFunc):
-    """
-    Callable object decorating a coroutine function for caching its return
-    value each time it is awaited.
-
-    This callable always returns an ``asyncio.Future`` object when called:
-    - If the function result is not cached, the returned future is added to
-      the event loop. Once the future is done, its result is persisted to the
-      store backend.
-    - If the function result is cached, the returned future is already done
-      with its result set to the cached function result.
-
-    Attributes
-    ----------
-    Same as :class:`joblib.memory.MemorizedFunc` plus ``loop``
-
-    loop: event loop
-        The event loop to use for the returned futures.
-    """
-
-    _load_item_for_mmap = False
-
-    def __init__(self, func, location, backend='local', ignore=None,
-                 mmap_mode=None, compress=False, verbose=1, timestamp=None,
-                 loop=None):
-        super().__init__(func, location, backend=backend, ignore=ignore,
-                         mmap_mode=mmap_mode, compress=compress,
-                         verbose=verbose, timestamp=timestamp)
-        self.loop = loop
-
-    def __getstate__(self):
-        """We can't store the event loop when pickling"""
-        state = super().__getstate__()
-        state['loop'] = None
-        return state
-
-    def __call__(self, *args, **kwargs):
-        out = super().__call__(*args, **kwargs)
-        if isinstance(out, asyncio.Future):
-            future = out
-        else:
-            future = asyncio.Future(loop=self.loop)
-            future.set_result(out)
-        return future
-
-    def call(self, path, args, kwargs):
-        return asyncio.ensure_future(self._call_async(path, args, kwargs),
-                                     loop=self.loop)
-
-    # exec is needed to define a function with 'yield from' while avoiding
-    # a SyntaxError on Python 2
-    if asyncio is not None:
-        exec("""
-@asyncio.coroutine
-def _call_async(self, path, args, kwargs):
-    out = yield from self.func(*args, **kwargs)
-    self.store_backend.dump_item(path, out, self._verbose)
-    if self.mmap_mode is not None:
-        out = self._load_item(path)
-    return out
-""")
-
-
-###############################################################################
 # class `Memory`
 ###############################################################################
 class Memory(Logger):
@@ -906,6 +866,9 @@ class Memory(Logger):
         backend_options: dict, optional
             Contains a dictionnary of named parameters used to configure
             the store backend.
+
+        loop: event loop, optional
+            The event loop to be used if func is a coroutine function
     """
     # ------------------------------------------------------------------------
     # Public interface
@@ -913,7 +876,7 @@ class Memory(Logger):
 
     def __init__(self, location=None, backend='local', cachedir=None,
                  mmap_mode=None, compress=False, verbose=1, bytes_limit=None,
-                 backend_options=None):
+                 backend_options=None, loop=None):
         # XXX: Bad explanation of the None value of cachedir
         Logger.__init__(self)
         self._verbose = verbose
@@ -922,6 +885,7 @@ class Memory(Logger):
         self.bytes_limit = bytes_limit
         self.backend = backend
         self.compress = compress
+        self.loop = loop
         if backend_options is None:
             backend_options = {}
         self.backend_options = backend_options
@@ -966,8 +930,7 @@ class Memory(Logger):
             return None
         return os.path.join(self.location, 'joblib')
 
-    def cache(self, func=None, ignore=None, verbose=None, mmap_mode=False,
-              loop=None):
+    def cache(self, func=None, ignore=None, verbose=None, mmap_mode=False):
         """ Decorates the given function func to only compute its return
             value for input arguments not cached on disk.
 
@@ -984,8 +947,6 @@ class Memory(Logger):
                 The memmapping mode used when loading from cache
                 numpy arrays. See numpy.load for the meaning of the
                 arguments. By default that of the memory object is used.
-            loop: event loop, optional
-                The event loop to be used if func is a coroutine function
 
             Returns
             -------
@@ -998,7 +959,7 @@ class Memory(Logger):
         if func is None:
             # Partial application, to be able to specify extra keyword
             # arguments in decorators
-            return functools.partial(self.cache, ignore=ignore, loop=loop,
+            return functools.partial(self.cache, ignore=ignore,
                                      verbose=verbose, mmap_mode=mmap_mode)
         if self.store_backend is None:
             return NotMemorizedFunc(func)
@@ -1008,14 +969,11 @@ class Memory(Logger):
             mmap_mode = self.mmap_mode
         if isinstance(func, MemorizedFunc):
             func = func.func
-        kwargs = dict(func=func, location=self.store_backend,
-                      backend=self.backend, ignore=ignore,
-                      mmap_mode=mmap_mode, compress=self.compress,
-                      verbose=verbose, timestamp=self.timestamp)
-        if asyncio is not None and asyncio.iscoroutinefunction(func):
-            return AsyncMemorizedFunc(loop=loop, **kwargs)
-        else:
-            return MemorizedFunc(**kwargs)
+        return MemorizedFunc(func, location=self.store_backend,
+                             backend=self.backend, loop=self.loop,
+                             ignore=ignore, mmap_mode=mmap_mode,
+                             compress=self.compress,
+                             verbose=verbose, timestamp=self.timestamp)
 
     def clear(self, warn=True):
         """ Erase the complete cache directory.
