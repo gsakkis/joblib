@@ -34,9 +34,8 @@ from ._store_backends import StoreBackendBase, FileSystemStoreBackend
 if sys.version_info[:2] >= (3, 4):
     import asyncio
     import pathlib
-    iscoroutinefunction = asyncio.iscoroutinefunction
 else:
-    iscoroutinefunction = lambda _: False
+    asyncio = pathlib = None
 
 
 FIRST_LINE_TEXT = "# first line:"
@@ -109,7 +108,7 @@ def _store_backend_factory(backend, location, verbose=0, backend_options=None):
     if backend_options is None:
         backend_options = {}
 
-    if sys.version_info[:2] >= (3, 4) and isinstance(location, pathlib.Path):
+    if pathlib is not None and isinstance(location, pathlib.Path):
         location = str(location)
 
     if isinstance(location, StoreBackendBase):
@@ -811,12 +810,11 @@ class AsyncMemorizedFunc(MemorizedFunc):
         The event loop to use for the returned futures.
     """
 
+    _load_item_for_mmap = False
+
     def __init__(self, func, location, backend='local', ignore=None,
                  mmap_mode=None, compress=False, verbose=1, timestamp=None,
                  loop=None):
-        if sys.version_info[:2] < (3, 4):
-            raise NotImplementedError("AsyncMemorizedFunc is only available "
-                                      "for python version >= 3.4")
         super().__init__(func, location, backend=backend, ignore=ignore,
                          mmap_mode=mmap_mode, compress=compress,
                          verbose=verbose, timestamp=timestamp)
@@ -841,15 +839,18 @@ class AsyncMemorizedFunc(MemorizedFunc):
         return asyncio.ensure_future(self._call_async(path, args, kwargs),
                                      loop=self.loop)
 
-    @asyncio.coroutine
-    def _call_async(self, path, args, kwargs):
-        out = yield from self.func(*args, **kwargs)
-        self.store_backend.dump_item(path, out, self._verbose)
-        if self.mmap_mode is not None:
-            out = self._load_item(path)
-        return out
-
-    _load_item_for_mmap = False
+    # exec is needed to define a function with 'yield from' while avoiding
+    # a SyntaxError on Python 2
+    if asyncio is not None:
+        exec("""
+@asyncio.coroutine
+def _call_async(self, path, args, kwargs):
+    out = yield from self.func(*args, **kwargs)
+    self.store_backend.dump_item(path, out, self._verbose)
+    if self.mmap_mode is not None:
+        out = self._load_item(path)
+    return out
+""")
 
 
 ###############################################################################
@@ -1011,7 +1012,7 @@ class Memory(Logger):
                       backend=self.backend, ignore=ignore,
                       mmap_mode=mmap_mode, compress=self.compress,
                       verbose=verbose, timestamp=self.timestamp)
-        if iscoroutinefunction(func):
+        if asyncio is not None and asyncio.iscoroutinefunction(func):
             return AsyncMemorizedFunc(loop=loop, **kwargs)
         else:
             return MemorizedFunc(**kwargs)
