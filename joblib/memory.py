@@ -33,8 +33,19 @@ from ._store_backends import StoreBackendBase, FileSystemStoreBackend
 
 if sys.version_info[:2] >= (3, 4):
     import pathlib
+    import asyncio
+    iscoroutinefunction = asyncio.iscoroutinefunction
+    iscoroutine = asyncio.iscoroutine
+    try:
+        isfuture = asyncio.isfuture
+    except AttributeError:
+        isfuture = lambda obj: isinstance(obj, asyncio.Future)
 else:
     pathlib = None
+    asyncio = None
+    iscoroutinefunction = lambda _: False
+    iscoroutine = lambda _: False
+    isfuture = lambda _: False
 
 
 FIRST_LINE_TEXT = "# first line:"
@@ -312,16 +323,34 @@ class NotMemorizedFunc(object):
     ----------
     func: callable
         Original undecorated function.
+
+    loop: event loop, optional
+        The event loop to be used if func is a coroutine function
     """
     # Should be a light as possible (for speed)
-    def __init__(self, func):
+    def __init__(self, func, loop=None):
         self.func = func
+        self.loop = loop
 
     def __call__(self, *args, **kwargs):
-        return self.func(*args, **kwargs)
+        out = self.func(*args, **kwargs)
+        if iscoroutinefunction(self.func):
+            return asyncio.ensure_future(out, loop=self.loop)
+        else:
+            return out
 
     def call_and_shelve(self, *args, **kwargs):
-        return NotMemorizedResult(self.func(*args, **kwargs))
+        out = self(*args, **kwargs)
+        if isfuture(out):
+            # create a new future that will hold a NotMemorizedResult
+            # with the value of awaited `out` (the computation future)
+            mem_future = asyncio.Future(loop=self.loop)
+            out.add_done_callback(lambda fut: mem_future.set_result(
+                NotMemorizedResult(fut.result())
+            ))
+            return mem_future
+        else:
+            return NotMemorizedResult(out)
 
     def __repr__(self):
         return '{0}(func={1})'.format(self.__class__.__name__, self.func)
@@ -371,19 +400,24 @@ class MemorizedFunc(Logger):
     verbose: int, optional
         The verbosity flag, controls messages that are issued as
         the function is evaluated.
+
+    loop: event loop, optional
+        The event loop to be used if func is a coroutine function
     """
     # ------------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------------
 
     def __init__(self, func, location, backend='local', ignore=None,
-                 mmap_mode=None, compress=False, verbose=1, timestamp=None):
+                 mmap_mode=None, compress=False, verbose=1, timestamp=None,
+                 loop=None):
         Logger.__init__(self)
         self.mmap_mode = mmap_mode
         self.compress = compress
         self.func = func
         self.func_id = _build_func_identifier(func)
         self.ignore = ignore if ignore is not None else []
+        self.loop = loop
         self._verbose = verbose
 
         # retrieve store object from backend type and location.
@@ -478,7 +512,7 @@ class MemorizedFunc(Logger):
             self._print_duration(duration)
 
         metadata = self._persist_input(duration, path, args, kwargs)
-        if self.mmap_mode is not None:
+        if self.mmap_mode is not None and not iscoroutinefunction(self.func):
             # Memmap the output at the first call to be consistent with
             # later calls
             out = self._load_item(path, metadata)
@@ -500,20 +534,36 @@ class MemorizedFunc(Logger):
             class "NotMemorizedResult" is used when there is no cache
             activated (e.g. location=None in Memory).
         """
-        _, args_id, metadata = self._cached_call(args, kwargs, shelving=True)
-        return MemorizedResult(self.store_backend, self.func_id, args_id,
-                               metadata=metadata, verbose=self._verbose - 1,
-                               timestamp=self.timestamp)
+        out, args_id, metadata = self._cached_call(args, kwargs, shelving=True)
+        mem_result = MemorizedResult(self.store_backend, self.func_id, args_id,
+                                     metadata=metadata,
+                                     timestamp=self.timestamp,
+                                     verbose=self._verbose - 1)
+        if isfuture(out):
+            # create a new future that will hold the mem_result
+            # but only after `out` (the computation future) is done
+            mem_future = asyncio.Future(loop=self.loop)
+            out.add_done_callback(lambda _: mem_future.set_result(mem_result))
+            return mem_future
+        else:
+            return mem_result
 
     def __call__(self, *args, **kwargs):
-        return self._cached_call(args, kwargs)[0]
+        out = self._cached_call(args, kwargs)[0]
+        if iscoroutinefunction(self.func) and not isfuture(out):
+            future = asyncio.Future(loop=self.loop)
+            future.set_result(out)
+            return future
+        else:
+            return out
 
     def __getstate__(self):
         """ We don't store the timestamp when pickling, to avoid the hash
-            depending from it.
+            depending from it. We also can't store the event loop.
         """
         state = self.__dict__.copy()
         state['timestamp'] = None
+        state['loop'] = None
         return state
 
     # ------------------------------------------------------------------------
@@ -658,9 +708,26 @@ class MemorizedFunc(Logger):
         """ Force the execution of the function with the given arguments and
             persist the output values.
         """
-        output = self.func(*args, **kwargs)
-        self.store_backend.dump_item(path, output, verbose=self._verbose)
-        return output
+        out = self.func(*args, **kwargs)
+        if iscoroutine(out):
+            return asyncio.ensure_future(self._call_async(path, out),
+                                         loop=self.loop)
+        else:
+            self.store_backend.dump_item(path, out, verbose=self._verbose)
+            return out
+
+    # exec is needed to define a function with 'yield from' while avoiding
+    # a SyntaxError on Python 2
+    if asyncio is not None:
+        exec("""
+@asyncio.coroutine
+def _call_async(self, path, coro):
+    out = yield from coro
+    self.store_backend.dump_item(path, out, verbose=self._verbose)
+    if self.mmap_mode is not None:
+        out = self._load_item(path)
+    return out
+""")
 
     def _persist_input(self, duration, path, args, kwargs,
                        this_duration_limit=0.5):
@@ -788,6 +855,9 @@ class Memory(Logger):
         backend_options: dict, optional
             Contains a dictionnary of named parameters used to configure
             the store backend.
+
+        loop: event loop, optional
+            The event loop to be used if func is a coroutine function
     """
     # ------------------------------------------------------------------------
     # Public interface
@@ -795,7 +865,7 @@ class Memory(Logger):
 
     def __init__(self, location=None, backend='local', cachedir=None,
                  mmap_mode=None, compress=False, verbose=1, bytes_limit=None,
-                 backend_options=None):
+                 backend_options=None, loop=None):
         # XXX: Bad explanation of the None value of cachedir
         Logger.__init__(self)
         self._verbose = verbose
@@ -804,6 +874,7 @@ class Memory(Logger):
         self.bytes_limit = bytes_limit
         self.backend = backend
         self.compress = compress
+        self.loop = loop
         if backend_options is None:
             backend_options = {}
         self.backend_options = backend_options
@@ -888,7 +959,7 @@ class Memory(Logger):
         if isinstance(func, MemorizedFunc):
             func = func.func
         return MemorizedFunc(func, location=self.store_backend,
-                             backend=self.backend,
+                             backend=self.backend, loop=self.loop,
                              ignore=ignore, mmap_mode=mmap_mode,
                              compress=self.compress,
                              verbose=verbose, timestamp=self.timestamp)
