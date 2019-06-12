@@ -192,7 +192,6 @@ class MemorizedResult(Logger):
                  mmap_mode=None, verbose=0, timestamp=None, metadata=None):
         Logger.__init__(self)
         self.path = (func_id, args_id)
-        self.func = func_id
         self.store_backend = _store_backend_factory(backend, location,
                                                     verbose=verbose)
         self.mmap_mode = mmap_mode
@@ -213,6 +212,14 @@ class MemorizedResult(Logger):
     @property
     def args_id(self):
         return self.path[1]
+
+    @property
+    def func(self):
+        warnings.warn(
+            "The 'func' attribute has been deprecated.\n"
+            "Use `func_id` attribute instead.",
+            DeprecationWarning, stacklevel=2)
+        return self.func_id
 
     @property
     def argument_hash(self):

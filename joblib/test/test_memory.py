@@ -506,12 +506,19 @@ def test_call_and_shelve(tmpdir):
         result.clear()  # Do nothing if there is no cache.
 
 
-def test_call_and_shelve_argument_hash(tmpdir):
-    # Verify that a warning is raised when accessing arguments_hash
+def test_call_and_shelve_func_argument_hash(tmpdir):
+    # Verify that a warning is raised when accessing func or arguments_hash
     # attribute from MemorizedResult
     func = Memory(location=tmpdir.strpath, verbose=0).cache(f)
     result = func.call_and_shelve(2)
     assert isinstance(result, MemorizedResult)
+
+    with warns(DeprecationWarning) as w:
+        assert result.func == result.func_id
+    assert len(w) == 1
+    assert "The 'func' attribute has been deprecated" \
+        in str(w[-1].message)
+
     with warns(DeprecationWarning) as w:
         assert result.argument_hash == result.args_id
     assert len(w) == 1
@@ -1160,7 +1167,7 @@ def test_memorized_result_pickle(tmpdir):
 
     assert memorized_result.store_backend.location == \
         memorized_result_loads.store_backend.location
-    assert memorized_result.func == memorized_result_loads.func
+    assert memorized_result.func_id == memorized_result_loads.func_id
     assert memorized_result.args_id == memorized_result_loads.args_id
     assert str(memorized_result) == str(memorized_result_loads)
 
