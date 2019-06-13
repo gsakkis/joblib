@@ -1,3 +1,4 @@
+import sys
 from pkg_resources import parse_version
 
 import pytest
@@ -13,6 +14,12 @@ try:
     from distributed.utils_test import loop
 except ImportError:
     loop = None
+
+if sys.version_info[:2] < (3, 5):
+    collect_ignore = [
+        'joblib/_memory_async.py',
+        'joblib/test/test_memory_async.py'
+    ]
 
 
 def pytest_collection_modifyitems(config, items):

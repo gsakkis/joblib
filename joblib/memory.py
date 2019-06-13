@@ -36,6 +36,13 @@ if sys.version_info[:2] >= (3, 4):
 else:
     pathlib = None
 
+if sys.version_info[:2] >= (3, 5):
+    import asyncio
+    iscoroutinefunction = asyncio.iscoroutinefunction
+else:
+    def iscoroutinefunction(_):
+        return False
+
 
 FIRST_LINE_TEXT = "# first line:"
 
@@ -631,11 +638,16 @@ class MemorizedFunc(Logger):
         """ Force the execution of the function with the given arguments and
             persist the output values.
         """
+        self._before_call(args, kwargs)
+        start_time = time.time()
+        out = self.func(*args, **kwargs)
+        return self._after_call(path, args, kwargs, shelving, out, start_time)
+
+    def _before_call(self, args, kwargs):
         if self._verbose > 0:
             print(format_call(self.func, args, kwargs))
 
-        start_time = time.time()
-        out = self.func(*args, **kwargs)
+    def _after_call(self, path, args, kwargs, shelving, out, start_time):
         self.store_backend.dump_item(path, out, verbose=self._verbose)
         duration = time.time() - start_time
         if self._verbose > 0:
@@ -875,18 +887,24 @@ class Memory(Logger):
             return functools.partial(self.cache, ignore=ignore,
                                      verbose=verbose, mmap_mode=mmap_mode)
         if self.store_backend is None:
-            return NotMemorizedFunc(func)
+            if iscoroutinefunction(func):
+                from ._memory_async import AsyncNotMemorizedFunc as cls
+            else:
+                cls = NotMemorizedFunc
+            return cls(func)
         if verbose is None:
             verbose = self._verbose
         if mmap_mode is False:
             mmap_mode = self.mmap_mode
         if isinstance(func, MemorizedFunc):
             func = func.func
-        return MemorizedFunc(func, location=self.store_backend,
-                             backend=self.backend,
-                             ignore=ignore, mmap_mode=mmap_mode,
-                             compress=self.compress,
-                             verbose=verbose, timestamp=self.timestamp)
+        if iscoroutinefunction(func):
+            from ._memory_async import AsyncMemorizedFunc as cls
+        else:
+            cls = MemorizedFunc
+        return cls(func, location=self.store_backend, backend=self.backend,
+                   ignore=ignore, mmap_mode=mmap_mode, compress=self.compress,
+                   verbose=verbose, timestamp=self.timestamp)
 
     def clear(self, warn=True):
         """ Erase the complete cache directory.
